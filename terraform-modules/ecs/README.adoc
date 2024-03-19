@@ -1,0 +1,335 @@
+
+# ECS Module
+
+This module contains the necessary terraform code to be used for stacks that will need to use ECS.
+
+The idea behind this document is to give the start point to use to create your stacks of the better way as possible.
+
+
+Firstly we need to get some information from the stack ze-prod-infrastructure, which is responsible to create all base infrastructure as VPC, Subnets and Bastion and to do that you can use the code below changing the variable values to production, development or performance.
+
+```
+data "terraform_remote_state" "infra" {
+  backend = "s3"
+  config  = {
+    bucket = "ze-${var.environment}-terraform-state"
+    key    = "base/terraform.tfstate"
+    region = "us-west-2"
+  }
+}
+
+```
+
+
+.A. Creating a ECS Cluster
+[%collapsible]
+=====
+After that, you can use the module ecs_withscaling/cluster to create you ECS cluter passing some informations to it that you can see below:
+
+source - referentian module path
+
+skip_capacity_provider - Flag to skip the capacity provider because terraform fails to create cluster
+
+cluster_name - Cluster name
+
+instance_type - What kind of instance will be used (m5a.large, m5a.xlarge, etc...)
+
+instance_key_pair_name - What ssh key the instances will use ( Important: You need to create this key before, because the module doesn't do this)
+
+cluster_maximum_size - Number maximum of instances the cluester can have
+
+cluster_minimum_size - Number minumum of instances the cluester can have
+
+tags - Tag to be included on the cluster ( please consult the convetion (https://www.notion.so/zedelivery/AWS-7171661119c94361a1ee3076a6d92041) )
+
+OBS: The example below is using variables instead of strings that could be a good approach in some cases.
+
+```
+module "ecs_with_scaling" {
+  source = "./ze-terraform/ecs/ecs_with_scaling/cluster"
+  skip_capacity_provider = var.skip_capacity_provider
+  cluster_name = var.ecs_cluster_name
+  instance_type = var.asg_instance_type
+  asg_subnets = data.aws_subnet_ids.private_subnets.ids
+  instance_key_pair_name = var.instance_key_pair_name
+  cluster_maximum_size = var.asg_maximum_capacity
+  cluster_minimum_size = var.asg_minimum_capacity
+  tags = {}
+}
+
+```
+=====
+
+.B. Creating a Container defination template
+[%collapsible]
+=====
+Now we alredy have the cluster and we need to have the container definitions. 
+
+Below you will find a container definition that we are using as a default definition. You need to copy the contentto a file files/container_definitions.json.tpl 
+
+```
+[
+  {
+    "name": "${service_name}",
+    "image": "${docker_image}",
+    "cpu": ${cpu},
+    "memory": ${memory},
+    "links": [
+    ],
+    "portMappings": ${exposed_ports},
+    "essential": true,
+    "environment": ${environment},
+    "mountPoints": ${mount_points},
+    "volumesFrom": [
+    ],
+    "secrets": [
+    ],
+    "startTimeout": 5,
+    "stopTimeout": 5,
+    "disableNetworking": false,
+    "privileged": false,
+    "readonlyRootFilesystem": false,
+    "dnsServers": [
+    ],
+    "dnsSearchDomains": [
+    ],
+    "dockerSecurityOptions": [
+    ],
+    "interactive": true,
+    "pseudoTerminal": true,
+    "ulimits": [
+    ],
+    "logConfiguration": {
+      "logDriver": "json-file",
+      "options": {
+      },
+      "secretOptions": [
+      ]
+    }
+  }
+]
+```
+
+And use the template passing some values to replace the variable ( ${variable} ) inside of it.
+
+cpu - CPU limit to the task
+
+memory - Memory limit to the task
+ 
+service_name - Server Name
+
+docker_image - image docker to be deployed
+
+exposed_ports - The ports to be exposed in the load balancers, below you will find a example
+```
+[{
+  protocol = "TCP"
+  port = 8080
+  health_check = {
+    interval = 30
+    path = null
+    protocol = "tcp"
+    timeout = null
+    healthy_threshold = 2
+    unhealthy_threshold = 2
+    matcher = null
+  }
+},{
+  protocol = "TCP"
+  port = 6514
+  health_check = {
+    interval = 30
+    path = null
+    protocol = "TCP"
+    timeout = null
+    healthy_threshold = 2
+    unhealthy_threshold = 2
+    matcher = null
+  }
+}]
+```
+
+environment - Variable to be use on container environment 
+
+mount_points - Mount point for external volumes
+
+```
+data "template_file" "telegraf_container_definitions" {
+  template = file(var.container_definitions_path)
+  vars = {
+    cpu = var.telegraf_cpu
+    memory = var.telegraf_memory
+    service_name = var.telegraf_service_name
+    docker_image = "${module.service_telegraf.docker_repository_url}:latest"
+    exposed_ports = jsonencode([
+      for p in var.telegraf_exposed_ports :
+      {
+        containerPort = p.port,
+        protocol = p.protocol == "udp"? "udp": "tcp"
+      }])
+    environment = jsonencode([])
+    mount_points = jsonencode([])
+  }
+}
+```
+=====
+
+.C. Creating a Service
+[%collapsible]
+=====
+Finally we are able to create the service and to do it you need to get some values from the AWS with the data resource that you can see below:
+
+```
+data "aws_route53_zone" "private_zone" {
+  name = var.private_dns_zone_name
+  private_zone = true
+}
+
+data "aws_route53_zone" "public_zone" {
+  name = var.public_dns_zone_name
+  private_zone = false
+}
+
+data "aws_ssm_parameter" "load_balancer_certificate_arn" {
+  count = var.load_balancer_certificate_arn == null && !var.skip_parameter_search? 1: 0
+  name = var.load_balancer_certificate_parameter_name
+  with_decryption = true
+}
+```
+
+
+source - referentian module path
+
+service_name - Service name
+
+ecs_cluster - Cluster name 
+ 
+vpc_id - Vpc Id 
+
+private_subnets - subnets ids on the list format [ "id1", "id2", "id3" ] 
+
+container_definitions - json with container defination ( data.template_file.telegraf_container_definitions.rendered )
+
+ordered_placement_strategies - AWS Order Placement Strategies
+
+policies - Policeis with service permission, you can find the perission in the code below
+
+service_desired_count - The default services number that will be online 
+
+min_tasks - The minimum services number that will be online 
+
+max_tasks - The maximum services number that will be online 
+
+exposed_ports - The ports will be exposed on the service 
+```
+[{
+  protocol = "TCP"
+  port = 8080
+  health_check = {
+    interval = 30
+    path = null
+    protocol = "tcp"
+    timeout = null
+    healthy_threshold = 2
+    unhealthy_threshold = 2
+    matcher = null
+  }
+},{
+  protocol = "TCP"
+  port = 6514
+  health_check = {
+    interval = 30
+    path = null
+    protocol = "TCP"
+    timeout = null
+    healthy_threshold = 2
+    unhealthy_threshold = 2
+    matcher = null
+  }
+}]
+```
+
+private_dns_zone_id -  Private DNS zone ID
+
+private_dns_zone_name - Private DNS zone Name
+
+public_dns_zone_id - Public DNS zone ID 
+
+public_dns_zone_name - Public DNS zone name
+
+load_balancer_type - Loadbalance type (application, network)
+
+image_mutability - If the docker image can be overwrite on AWS ECR (IMMUTABLE, MUTABLE)
+
+load_balancer_certificate_arn - Certificate arn to be use on loadbalance
+
+capacity_provider_strategies - "The settings of the capacity provider strategy. See AWS the documentation for more info."
+
+```
+module "service_telegraf" {
+  source = "./ze-terraform/ecs/service"
+  private_subnets = data.aws_subnet_ids.private_subnets.ids
+  container_definitions = data.template_file.telegraf_container_definitions.rendered
+  ecs_cluster = module.ecs_with_scaling.cluster_name
+  ordered_placement_strategies = []
+  policies = [{
+    name = "telegraf_bootstrap_parameters"
+    permissions = [
+      {
+        actions = [
+          "ssm:DescribeParameters",
+          "ssm:GetParameter",
+        ]
+        resources = [
+          module.courier_dbname.arn,
+          module.courier_endpoint_parameter.arn,
+          data.aws_ssm_parameter.courier_user_parameter.arn,
+          data.aws_ssm_parameter.courier_password_parameter.arn,
+          module.telegraf_user.arn,
+          module.telegraf_password.arn,
+          module.influxdb_url.arn,
+          data.aws_ssm_parameter.pgpool_tg_name.arn,
+        ]
+      },
+      {
+        actions = ["kms:Decrypt", "kms:DescribeKey"]
+        resources = [
+          module.telegraf_user.key_arn,
+          module.telegraf_password.key_arn,
+          module.courier_dbname.key_arn,
+          module.courier_endpoint_parameter.key_arn,
+        ]
+      },
+      {
+        actions = [
+          "cloudwatch:PutMetricData",
+          "cloudwatch:GetMetricData"
+        ]
+        resources = ["*"]
+      }
+    ]
+  }]
+  service_desired_count = 1
+  min_tasks = 1
+  max_tasks = 1
+  service_name = var.telegraf_service_name
+  volumes = []
+  vpc_id = local.vpc_id
+  task_def_cpu = var.telegraf_cpu
+  task_def_memory = var.telegraf_memory
+  exposed_ports = var.telegraf_exposed_ports
+  private_dns_zone_id = data.aws_route53_zone.private_zone.id
+  private_dns_zone_name = data.aws_route53_zone.private_zone.name
+  public_dns_zone_id = data.aws_route53_zone.public_zone.zone_id
+  public_dns_zone_name = data.aws_route53_zone.public_zone.name
+  load_balancer_type = "network"
+  image_mutability = "MUTABLE"
+  load_balancer_certificate_arn = local.load_balancer_certificate_arn
+  capacity_provider_strategies = [{
+    capacity_provider = module.ecs_with_scaling.capacity_provider_name
+    weight = 100
+    base = 1
+  }]
+}
+```
+=====
