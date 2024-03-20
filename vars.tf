@@ -37,7 +37,7 @@ variable "ecs_cluster_name" {
 
 variable "asg_instance_type" {
   description = "The instance to be present into the cluster"
-  default = "t3.micro"
+  default = "t3.medium"
 }
 
 variable "instance_key_pair_name" {
